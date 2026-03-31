@@ -414,7 +414,7 @@ do_start() {
     echo "Waiting for model '${alias}' to appear at gateway ${GATEWAY_URL}..."
     local elapsed=0
     while [[ "$elapsed" -lt "$HEALTH_TIMEOUT" ]]; do
-        if curl -s "${GATEWAY_URL}" | grep -q "\"id\": \"${alias}\""; then
+        if curl -s "${GATEWAY_URL}" | grep -Ei "\"id\"\s*:\s*\"${alias}\""; then
             echo "SUCCESS: Cluster is online and serving alias '${alias}'."
             return 0
         fi
