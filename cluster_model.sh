@@ -194,7 +194,6 @@ After=network-online.target
 User=labroot
 WorkingDirectory=/home/labroot
 
-Environment=VLLM_USE_V1=0
 Environment=VLLM_TARGET_DEVICE=cpu
 Environment=VLLM_CPU_KVCACHE_SPACE=${KV_CACHE_GB}
 Environment=VLLM_CPU_OMP_THREADS_BIND=auto
