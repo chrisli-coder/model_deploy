@@ -414,7 +414,7 @@ do_start() {
     echo "Waiting for model '${alias}' to appear at gateway ${GATEWAY_URL}..."
     local elapsed=0
     while [[ "$elapsed" -lt "$HEALTH_TIMEOUT" ]]; do
-        if curl -s "${GATEWAY_URL}" | grep -Ei "\"id\"\s*:\s*\"${alias}\""; then
+        if curl -s "${GATEWAY_URL}" | grep -qEi "\"id\"\s*:\s*\"${alias}\""; then
             echo "SUCCESS: Cluster is online and serving alias '${alias}'."
             return 0
         fi
@@ -466,8 +466,7 @@ do_status() {
     echo
     echo "Gateway models at ${GATEWAY_URL}:"
     if command -v curl >/dev/null 2>&1; then
-        curl -s "${GATEWAY_URL}" || echo "  (failed to query gateway)"
-        echo
+        curl -s "${GATEWAY_URL}" | python3 -c "import sys, json; print(json.dumps(json.load(sys.stdin), indent=2))" 2>/dev/null || echo "  (failed to query gateway)"        echo
     else
         echo "  curl not available; skipping gateway query."
     fi
