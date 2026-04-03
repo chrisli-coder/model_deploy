@@ -107,6 +107,7 @@ Start options:
   --block-size N           Maps to vLLM --block-size (default: ${BLOCK_SIZE}).
   --max-num-batched-tokens N
                            Maps to vLLM --max-num-batched-tokens (default: ${DEFAULT_MAX_BATCH_SIZE}).
+  --kv-cache-gb N          CPU KV cache size in GB for VLLM_CPU_KVCACHE_SPACE (default: ${KV_CACHE_GB}).
 
 Examples:
   # Default: PD OFF, all nodes homogeneous
@@ -176,6 +177,7 @@ generate_service_file() {
     local max_len="$8"
     local max_seqs="$9"
     local block_size="${10}"
+    local kv_cache_gb="${11}"
 
     # Build optional PD-specific environment and ExecStart flags
     local pd_env=""
@@ -207,7 +209,7 @@ User=labroot
 WorkingDirectory=/home/labroot
 
 Environment=VLLM_TARGET_DEVICE=cpu
-Environment=VLLM_CPU_KVCACHE_SPACE=${KV_CACHE_GB}
+Environment=VLLM_CPU_KVCACHE_SPACE=${kv_cache_gb}
 Environment=VLLM_CPU_OMP_THREADS_BIND=auto
 Environment="OMP_NUM_THREADS=${OMP_NUM_THREADS}"
 Environment="MKL_NUM_THREADS=${MKL_NUM_THREADS}"
@@ -252,6 +254,7 @@ do_start() {
     local max_len="${MAX_LEN}"
     local max_seqs="${MAX_SEQS}"
     local block_size="${BLOCK_SIZE}"
+    local kv_cache_gb="${KV_CACHE_GB}"
     local pd_flag="${PD_ENABLED}"
     local no_pd_set="false"
 
@@ -306,6 +309,10 @@ do_start() {
                 shift
                 block_size="${1:-}"
                 ;;
+            --kv-cache-gb)
+                shift
+                kv_cache_gb="${1:-}"
+                ;;
             *)
                 error_exit "Unknown option for start: $1"
                 ;;
@@ -322,6 +329,7 @@ do_start() {
     [[ "$max_len" =~ ^[0-9]+$ ]] || error_exit "--max-model-len must be a positive integer."
     [[ "$max_seqs" =~ ^[0-9]+$ ]] || error_exit "--max-num-seqs must be a positive integer."
     [[ "$block_size" =~ ^[0-9]+$ ]] || error_exit "--block-size must be a positive integer."
+    [[ "$kv_cache_gb" =~ ^[0-9]+$ ]] || error_exit "--kv-cache-gb must be a positive integer."
 
     [[ "$tp_size" -ge 1 ]] || error_exit "--tp must be >= 1."
     [[ "$pp_size" -ge 1 ]] || error_exit "--pp must be >= 1."
@@ -329,6 +337,7 @@ do_start() {
     [[ "$max_seqs" -ge 1 ]] || error_exit "--max-num-seqs must be >= 1."
     [[ "$block_size" -ge 1 ]] || error_exit "--block-size must be >= 1."
     [[ "$max_batch" -ge 1 ]] || error_exit "--max-num-batched-tokens must be >= 1."
+    [[ "$kv_cache_gb" -ge 1 ]] || error_exit "--kv-cache-gb must be >= 1."
 
     # Decide PD enablement:
     # - If --no-pd was given, PD stays disabled even if roles/counts are provided.
@@ -360,6 +369,7 @@ do_start() {
     echo "  Max model len      : ${max_len}"
     echo "  Max num seqs       : ${max_seqs}"
     echo "  Block size         : ${block_size}"
+    echo "  KV cache GB        : ${kv_cache_gb}"
 
     # Determine roles per node
     local roles=()
@@ -423,7 +433,7 @@ do_start() {
         echo "Configuring node ${mgmt_ip} (RDMA ${rdma_ip}, role=${role})..."
 
         generate_service_file "$role" "$rdma_ip" "$model_path" "$alias" \
-            "$tp_size" "$pp_size" "$max_batch" "$max_len" "$max_seqs" "$block_size"
+            "$tp_size" "$pp_size" "$max_batch" "$max_len" "$max_seqs" "$block_size" "$kv_cache_gb"
 
         scp vllm.service.tmp "labroot@${mgmt_ip}:/tmp/vllm.service" >/dev/null 2>&1 || \
             error_exit "Failed to copy service file to ${mgmt_ip}."
@@ -470,7 +480,7 @@ do_start() {
             echo "Max num seqs:                       ${max_seqs}"
             echo "Block size:                         ${block_size}"
             echo "Max num batched tokens:            ${max_batch}"
-            echo "KV cache space (GB):               ${KV_CACHE_GB}"
+            echo "VLLM_CPU_KVCACHE_SPACE (GB):       ${kv_cache_gb}"
             echo "OMP_NUM_THREADS:                   ${OMP_NUM_THREADS}"
             echo "MKL_NUM_THREADS:                   ${MKL_NUM_THREADS}"
             echo "LD_PRELOAD (tcmalloc):             ${TCMALLOC_PATH}"
