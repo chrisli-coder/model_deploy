@@ -86,7 +86,7 @@ Start options:
   --alias <served-name>    Web alias for the model (default: basename of model path).
 
   # Prefill / decode (PD) split
-  # By default PD is OFF. It is automatically enabled
+  # By default PD is OFF. 
   # when --roles or --num-prefill/--num-decode are provided.
   --roles prefill,prefill,decode,decode
                            Explicit role per node (positionally mapped to nodes
@@ -101,10 +101,12 @@ Start options:
   --tp N                   Tensor parallel size (default: ${DEFAULT_TP_SIZE}).
   --pp M                   Pipeline parallel size (default: ${DEFAULT_PP_SIZE}).
 
-  # Batching / sequence limits
-  --batch-size B           Max batch size per vLLM instance (default: ${DEFAULT_MAX_BATCH_SIZE}).
-  --max-len L              Max model length (default: ${MAX_LEN}).
-  --max-seqs S             Max number of sequences (default: ${MAX_SEQS}).
+  # vLLM limits (defaults from script header if omitted)
+  --max-model-len N        Maps to vLLM --max-model-len (default: ${MAX_LEN}).
+  --max-num-seqs N         Maps to vLLM --max-num-seqs (default: ${MAX_SEQS}).
+  --block-size N           Maps to vLLM --block-size (default: ${BLOCK_SIZE}).
+  --max-num-batched-tokens N
+                           Maps to vLLM --max-num-batched-tokens (default: ${DEFAULT_MAX_BATCH_SIZE}).
 
 Examples:
   # Default: PD OFF, all nodes homogeneous
@@ -112,10 +114,10 @@ Examples:
 
   # Enable PD with explicit roles
   $0 start --model llama-7b --alias llama-pd \\
-      --roles prefill,prefill,decode,decode --tp 2 --pp 2 --batch-size 32
+      --roles prefill,prefill,decode,decode --tp 2 --pp 2 --max-num-batched-tokens 32
 
   # Enable PD with counts (2 prefill, 2 decode)
-  $0 start --model llama-7b --num-prefill 2 --num-decode 2 --tp 4 --batch-size 64
+  $0 start --model llama-7b --num-prefill 2 --num-decode 2 --tp 4 --max-num-batched-tokens 64
 
 EOF
 }
@@ -173,6 +175,7 @@ generate_service_file() {
     local max_batch="$7"
     local max_len="$8"
     local max_seqs="$9"
+    local block_size="${10}"
 
     # Build optional PD-specific environment and ExecStart flags
     local pd_env=""
@@ -218,7 +221,7 @@ ExecStart=${PYTHON_BIN} -m vllm.entrypoints.openai.api_server \\
   --served-model-name ${model_alias} \\
   --max-model-len ${max_len} \\
   --max-num-seqs ${max_seqs} \\
-  --block-size ${BLOCK_SIZE} \\
+  --block-size ${block_size} \\
   --max-num-batched-tokens ${max_batch} \\
   --enable-prefix-caching \\
   ${tp_flag} \\
@@ -248,6 +251,7 @@ do_start() {
     local max_batch="${DEFAULT_MAX_BATCH_SIZE}"
     local max_len="${MAX_LEN}"
     local max_seqs="${MAX_SEQS}"
+    local block_size="${BLOCK_SIZE}"
     local pd_flag="${PD_ENABLED}"
     local no_pd_set="false"
 
@@ -286,17 +290,21 @@ do_start() {
                 shift
                 pp_size="${1:-}"
                 ;;
-            --batch-size)
+            --max-num-batched-tokens)
                 shift
                 max_batch="${1:-}"
                 ;;
-            --max-len)
+            --max-model-len)
                 shift
                 max_len="${1:-}"
                 ;;
-            --max-seqs)
+            --max-num-seqs)
                 shift
                 max_seqs="${1:-}"
+                ;;
+            --block-size)
+                shift
+                block_size="${1:-}"
                 ;;
             *)
                 error_exit "Unknown option for start: $1"
@@ -310,12 +318,17 @@ do_start() {
     # Validate numeric values
     [[ "$tp_size" =~ ^[0-9]+$ ]] || error_exit "--tp must be a positive integer."
     [[ "$pp_size" =~ ^[0-9]+$ ]] || error_exit "--pp must be a positive integer."
-    [[ "$max_batch" =~ ^[0-9]+$ ]] || error_exit "--batch-size must be a positive integer."
-    [[ "$max_len" =~ ^[0-9]+$ ]] || error_exit "--max-len must be a positive integer."
-    [[ "$max_seqs" =~ ^[0-9]+$ ]] || error_exit "--max-seqs must be a positive integer."
+    [[ "$max_batch" =~ ^[0-9]+$ ]] || error_exit "--max-num-batched-tokens must be a positive integer."
+    [[ "$max_len" =~ ^[0-9]+$ ]] || error_exit "--max-model-len must be a positive integer."
+    [[ "$max_seqs" =~ ^[0-9]+$ ]] || error_exit "--max-num-seqs must be a positive integer."
+    [[ "$block_size" =~ ^[0-9]+$ ]] || error_exit "--block-size must be a positive integer."
 
     [[ "$tp_size" -ge 1 ]] || error_exit "--tp must be >= 1."
     [[ "$pp_size" -ge 1 ]] || error_exit "--pp must be >= 1."
+    [[ "$max_len" -ge 1 ]] || error_exit "--max-model-len must be >= 1."
+    [[ "$max_seqs" -ge 1 ]] || error_exit "--max-num-seqs must be >= 1."
+    [[ "$block_size" -ge 1 ]] || error_exit "--block-size must be >= 1."
+    [[ "$max_batch" -ge 1 ]] || error_exit "--max-num-batched-tokens must be >= 1."
 
     # Decide PD enablement:
     # - If --no-pd was given, PD stays disabled even if roles/counts are provided.
@@ -343,9 +356,10 @@ do_start() {
     echo "  Alias      : ${alias}"
     echo "  TP / PP    : ${tp_size} / ${pp_size}"
     echo "  PD enabled : ${pd_flag}"
-    echo "  Max batch  : ${max_batch}"
-    echo "  Max len    : ${max_len}"
-    echo "  Max seqs   : ${max_seqs}"
+    echo "  Max batched tokens : ${max_batch}"
+    echo "  Max model len      : ${max_len}"
+    echo "  Max num seqs       : ${max_seqs}"
+    echo "  Block size         : ${block_size}"
 
     # Determine roles per node
     local roles=()
@@ -409,13 +423,13 @@ do_start() {
         echo "Configuring node ${mgmt_ip} (RDMA ${rdma_ip}, role=${role})..."
 
         generate_service_file "$role" "$rdma_ip" "$model_path" "$alias" \
-            "$tp_size" "$pp_size" "$max_batch" "$max_len" "$max_seqs"
+            "$tp_size" "$pp_size" "$max_batch" "$max_len" "$max_seqs" "$block_size"
 
         scp vllm.service.tmp "labroot@${mgmt_ip}:/tmp/vllm.service" >/dev/null 2>&1 || \
             error_exit "Failed to copy service file to ${mgmt_ip}."
 
-        ssh "labroot@${mgmt_ip}" "sudo mv /tmp/vllm.service /etc/systemd/system/vllm.service && sudo systemctl daemon-reload && sudo systemctl restart vllm" >/dev/null 2>&1 || \
-            error_exit "Failed to restart vllm service on ${mgmt_ip}."
+        ssh "labroot@${mgmt_ip}" "sudo mv /tmp/vllm.service /etc/systemd/system/vllm.service && sudo systemctl daemon-reload && sudo systemctl enable vllm && sudo systemctl restart vllm" >/dev/null 2>&1 || \
+            error_exit "Failed to enable/restart vllm service on ${mgmt_ip}."
     done
 
     rm -f vllm.service.tmp
@@ -426,6 +440,49 @@ do_start() {
     while [[ "$elapsed" -lt "$HEALTH_TIMEOUT" ]]; do
         if curl -s "${GATEWAY_URL}" | grep -qEi "\"id\"\s*:\s*\"${alias}\""; then
             echo "SUCCESS: Cluster is online and serving alias '${alias}'."
+            echo ""
+            echo "========== Effective configuration (all nodes) =========="
+            echo "Python (uv):                       ${PYTHON_BIN}"
+            echo "Model path (--model):               ${model_path}"
+            echo "Served name (--served-model-name):  ${alias}"
+            echo "Listen:                             host=0.0.0.0 port=8000"
+            echo "Tensor parallel size:              ${tp_size}"
+            echo "Pipeline parallel size:            ${pp_size}"
+            if [[ "$tp_size" -gt 1 ]]; then
+                echo "ExecStart --tensor-parallel-size: ${tp_size}"
+            else
+                echo "ExecStart --tensor-parallel-size:  (omitted, tp=1)"
+            fi
+            if [[ "$pp_size" -gt 1 ]]; then
+                echo "ExecStart --pipeline-parallel-size: ${pp_size}"
+            else
+                echo "ExecStart --pipeline-parallel-size:  (omitted, pp=1)"
+            fi
+            echo "Prefill/decode (PD) enabled:       ${pd_flag}"
+            if [[ "$pd_flag" == "true" ]]; then
+                echo "NIXL interface:                    ${NIXL_INTERFACE}"
+                echo "KV connector port:                 ${KV_PORT}"
+            fi
+            echo "VLLM_TARGET_DEVICE:                cpu"
+            echo "VLLM_CPU_OMP_THREADS_BIND:        auto"
+            echo "VLLM_LOGGING_LEVEL:                info"
+            echo "Max model len:                      ${max_len}"
+            echo "Max num seqs:                       ${max_seqs}"
+            echo "Block size:                         ${block_size}"
+            echo "Max num batched tokens:            ${max_batch}"
+            echo "KV cache space (GB):               ${KV_CACHE_GB}"
+            echo "OMP_NUM_THREADS:                   ${OMP_NUM_THREADS}"
+            echo "MKL_NUM_THREADS:                   ${MKL_NUM_THREADS}"
+            echo "LD_PRELOAD (tcmalloc):             ${TCMALLOC_PATH}"
+            echo "LD_PRELOAD (iomp5):                ${IOMP5_PATH}"
+            echo "Prefix caching:                     enabled (--enable-prefix-caching)"
+            echo "Gateway (health check):            ${GATEWAY_URL}"
+            echo ""
+            echo "Per-node role (VLLM_DIST_ROLE when PD on):"
+            for i in "${!MGMT_NODES[@]}"; do
+                echo "  ${MGMT_NODES[$i]}  RDMA ${RDMA_IPS[$i]}  role=${roles[$i]}"
+            done
+            echo "========================================================="
             return 0
         fi
         echo "  Not ready yet... (${elapsed}/${HEALTH_TIMEOUT}s)"

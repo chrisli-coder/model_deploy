@@ -74,10 +74,11 @@ In this example, `--no-pd` **forces PD off** even though roles are specified, so
   --alias llama-tp2-pp2 \
   --tp 2 \
   --pp 2 \
-  --batch-size 32 \
-  --max-len 4096 \
-  --max-seqs 16
+  --max-num-batched-tokens 32 \
+  --max-model-len 4096 \
+  --max-num-seqs 16 \
+  --block-size 32
 ```
 
-Adjust `--tp` and `--pp` based on your vLLM deployment topology and hardware, and tune `--batch-size`, `--max-len`, and `--max-seqs` as needed for throughput and latency.
+Adjust `--tp` and `--pp` based on your vLLM deployment topology and hardware, and tune `--max-num-batched-tokens`, `--max-model-len`, `--max-num-seqs`, and `--block-size` (defaults apply when omitted) as needed for throughput and latency.
 
