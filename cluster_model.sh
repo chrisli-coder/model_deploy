@@ -4,6 +4,9 @@
 # Multi-node vLLM cluster controller (CPU, RDMA, PD split)
 # Node controller host: 192.168.1.145
 # Target nodes: 192.168.1.141-144 (management) with 100.0.0.1-4 (RDMA)
+#
+# All worker nodes must use a uv-managed virtual environment (not conda).
+# Set PYTHON_BIN (and IOMP5_PATH under the same venv) to match `uv venv` layout on each node.
 # ==========================================================
 
 set -euo pipefail
@@ -16,13 +19,13 @@ set -euo pipefail
 MGMT_NODES=("192.168.1.141" "192.168.1.142" "192.168.1.143" "192.168.1.144")
 
 # RDMA network IPs mapped positionally to MGMT_NODES
-RDMA_IPS=("100.0.0.1" "100.0.0.2" "100.0.0.3" "100.0.0.4")
+RDMA_IPS=("100.0.0.141" "100.0.0.142" "100.0.0.143" "100.0.0.144")
 
 # Gateway URL for health checks (OpenAI-compatible endpoint)
 GATEWAY_URL="http://192.168.1.145/v1/models"
 
-# Python binary and models root
-PYTHON_BIN="/home/labroot/miniconda3/envs/vllm-cpu/bin/python"
+# Python: uv virtualenv on each node (not conda). Sync deps with e.g. `uv sync` in that environment.
+PYTHON_BIN="/home/labroot/vllm-cpu/bin/python"
 MODELS_ROOT="/home/labroot/models"
 
 # CPU tuning defaults
@@ -36,7 +39,8 @@ OMP_NUM_THREADS=8
 MKL_NUM_THREADS=8
 
 TCMALLOC_PATH="/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4"
-IOMP5_PATH="/home/labroot/miniconda3/envs/vllm-cpu/lib/libiomp5.so"
+# Intel OMP inside the same uv venv as PYTHON_BIN (if present).
+IOMP5_PATH="/home/labroot/vllm-cpu/lib/libiomp5.so"
 
 # Parallelism defaults
 DEFAULT_TP_SIZE=1
@@ -64,6 +68,11 @@ Usage:
   $0 stop
   $0 restart
   $0 status
+
+Environment (required):
+  vLLM on every worker node must run under a uv-managed virtual environment, not conda.
+  Configure PYTHON_BIN (and IOMP5_PATH if used) in this script to the Python and libs from
+  that uv venv so systemd ExecStart matches your cluster layout.
 
 Subcommands:
   start      Start or switch the cluster to a given model.
@@ -329,6 +338,7 @@ do_start() {
     fi
 
     echo "Starting cluster with:"
+    echo "  Python (uv, not conda): ${PYTHON_BIN}"
     echo "  Model path : ${model_path}"
     echo "  Alias      : ${alias}"
     echo "  TP / PP    : ${tp_size} / ${pp_size}"
@@ -466,7 +476,8 @@ do_status() {
     echo
     echo "Gateway models at ${GATEWAY_URL}:"
     if command -v curl >/dev/null 2>&1; then
-        curl -s "${GATEWAY_URL}" | python3 -c "import sys, json; print(json.dumps(json.load(sys.stdin), indent=2))" 2>/dev/null || echo "  (failed to query gateway)"        echo
+        curl -s "${GATEWAY_URL}" | python3 -c "import sys, json; print(json.dumps(json.load(sys.stdin), indent=2))" 2>/dev/null || echo "  (failed to query gateway)"
+        echo
     else
         echo "  curl not available; skipping gateway query."
     fi
@@ -490,6 +501,8 @@ main() {
     local cmd
     cmd=$(echo "$1" | tr '[:upper:]' '[:lower:]')
     shift || true
+
+    echo "Runtime: vLLM workers use a uv virtualenv (not conda). PYTHON_BIN=${PYTHON_BIN}"
 
     case "$cmd" in
         start|switch)
