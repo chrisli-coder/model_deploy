@@ -77,8 +77,9 @@ In this example, `--no-pd` **forces PD off** even though roles are specified, so
   --max-num-batched-tokens 32 \
   --max-model-len 4096 \
   --max-num-seqs 16 \
-  --block-size 32
+  --block-size 32 \
+  --performance-mode throughput
 ```
 
-Adjust `--tp` and `--pp` based on your vLLM deployment topology and hardware, and tune `--max-num-batched-tokens`, `--max-model-len`, `--max-num-seqs`, and `--block-size` (defaults apply when omitted) as needed for throughput and latency.
+Adjust `--tp` and `--pp` based on your vLLM deployment topology and hardware, and tune `--max-num-batched-tokens`, `--max-model-len`, `--max-num-seqs`, `--block-size`, and `--performance-mode` (`balanced`, `interactivity`, or `throughput`; defaults apply when omitted) as needed for throughput and latency.
 

@@ -46,6 +46,9 @@ IOMP5_PATH="/home/labroot/vllm-cpu/lib/libiomp5.so"
 DEFAULT_TP_SIZE=1
 DEFAULT_PP_SIZE=1
 
+# vLLM --performance-mode (matches EngineArgs / VllmConfig.performance_mode)
+DEFAULT_PERFORMANCE_MODE="balanced"
+
 # PD / RDMA defaults
 # By default PD is disabled unless roles / num-prefill / num-decode are provided.
 PD_ENABLED=false
@@ -108,6 +111,8 @@ Start options:
   --max-num-batched-tokens N
                            Maps to vLLM --max-num-batched-tokens (default: ${DEFAULT_MAX_BATCH_SIZE}).
   --kv-cache-gb N          CPU KV cache size in GB for VLLM_CPU_KVCACHE_SPACE (default: ${KV_CACHE_GB}).
+  --performance-mode MODE  vLLM --performance-mode: balanced | interactivity | throughput
+                           (default: ${DEFAULT_PERFORMANCE_MODE}).
 
 Examples:
   # Default: PD OFF, all nodes homogeneous
@@ -178,6 +183,7 @@ generate_service_file() {
     local max_seqs="$9"
     local block_size="${10}"
     local kv_cache_gb="${11}"
+    local performance_mode="${12}"
 
     # Build optional PD-specific environment and ExecStart flags
     local pd_env=""
@@ -225,6 +231,7 @@ ExecStart=${PYTHON_BIN} -m vllm.entrypoints.openai.api_server \\
   --max-num-seqs ${max_seqs} \\
   --block-size ${block_size} \\
   --max-num-batched-tokens ${max_batch} \\
+  --performance-mode ${performance_mode} \\
   --enable-prefix-caching \\
   ${tp_flag} \\
   ${pp_flag}
@@ -255,6 +262,7 @@ do_start() {
     local max_seqs="${MAX_SEQS}"
     local block_size="${BLOCK_SIZE}"
     local kv_cache_gb="${KV_CACHE_GB}"
+    local performance_mode="${DEFAULT_PERFORMANCE_MODE}"
     local pd_flag="${PD_ENABLED}"
     local no_pd_set="false"
 
@@ -313,6 +321,10 @@ do_start() {
                 shift
                 kv_cache_gb="${1:-}"
                 ;;
+            --performance-mode)
+                shift
+                performance_mode="${1:-}"
+                ;;
             *)
                 error_exit "Unknown option for start: $1"
                 ;;
@@ -338,6 +350,14 @@ do_start() {
     [[ "$block_size" -ge 1 ]] || error_exit "--block-size must be >= 1."
     [[ "$max_batch" -ge 1 ]] || error_exit "--max-num-batched-tokens must be >= 1."
     [[ "$kv_cache_gb" -ge 1 ]] || error_exit "--kv-cache-gb must be >= 1."
+
+    performance_mode=$(echo "$performance_mode" | tr '[:upper:]' '[:lower:]')
+    case "$performance_mode" in
+        balanced|interactivity|throughput) ;;
+        *)
+            error_exit "--performance-mode must be one of: balanced, interactivity, throughput (got '${performance_mode}')"
+            ;;
+    esac
 
     # Decide PD enablement:
     # - If --no-pd was given, PD stays disabled even if roles/counts are provided.
@@ -370,6 +390,7 @@ do_start() {
     echo "  Max num seqs       : ${max_seqs}"
     echo "  Block size         : ${block_size}"
     echo "  KV cache GB        : ${kv_cache_gb}"
+    echo "  Performance mode   : ${performance_mode}"
 
     # Determine roles per node
     local roles=()
@@ -433,7 +454,7 @@ do_start() {
         echo "Configuring node ${mgmt_ip} (RDMA ${rdma_ip}, role=${role})..."
 
         generate_service_file "$role" "$rdma_ip" "$model_path" "$alias" \
-            "$tp_size" "$pp_size" "$max_batch" "$max_len" "$max_seqs" "$block_size" "$kv_cache_gb"
+            "$tp_size" "$pp_size" "$max_batch" "$max_len" "$max_seqs" "$block_size" "$kv_cache_gb" "$performance_mode"
 
         scp vllm.service.tmp "labroot@${mgmt_ip}:/tmp/vllm.service" >/dev/null 2>&1 || \
             error_exit "Failed to copy service file to ${mgmt_ip}."
@@ -480,6 +501,7 @@ do_start() {
             echo "Max num seqs:                       ${max_seqs}"
             echo "Block size:                         ${block_size}"
             echo "Max num batched tokens:            ${max_batch}"
+            echo "Performance mode (--performance-mode): ${performance_mode}"
             echo "VLLM_CPU_KVCACHE_SPACE (GB):       ${kv_cache_gb}"
             echo "OMP_NUM_THREADS:                   ${OMP_NUM_THREADS}"
             echo "MKL_NUM_THREADS:                   ${MKL_NUM_THREADS}"
