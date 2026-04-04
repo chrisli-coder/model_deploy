@@ -49,11 +49,27 @@ DEFAULT_PP_SIZE=1
 # vLLM --performance-mode (matches EngineArgs / VllmConfig.performance_mode)
 DEFAULT_PERFORMANCE_MODE="balanced"
 
-# PD / RDMA defaults
-# By default PD is disabled unless roles / num-prefill / num-decode are provided.
+# PD defaults (PD is disabled unless roles / num-prefill / num-decode are provided.)
 PD_ENABLED=false
-NIXL_INTERFACE="rxe0"
-KV_PORT=20000
+# Default kv_connector for --kv-transfer-config: exact string for vLLM KVConnectorFactory (v1 registry).
+KV_CONNECTOR="NixlConnector"
+# Names from vllm.distributed.kv_transfer.kv_connector.factory KVConnectorFactory.register_connector
+KV_CONNECTOR_REGISTRY=(
+    ExampleConnector
+    ExampleHiddenStatesConnector
+    P2pNcclConnector
+    LMCacheConnectorV1
+    LMCacheMPConnector
+    NixlConnector
+    MultiConnector
+    MoRIIOConnector
+    OffloadingConnector
+    DecodeBenchConnector
+    MooncakeConnector
+    FlexKVConnectorV1
+)
+# Shown in pre-deploy summary only when PD is on (vLLM default master port; not passed on CLI)
+VLLM_DEFAULT_MASTER_PORT_DOC=29501
 
 # Health check defaults (seconds)
 HEALTH_TIMEOUT=300
@@ -98,9 +114,20 @@ Start options:
   --num-decode M           Number of decode nodes after prefill nodes.
                            (N + M must equal number of nodes). Mutually exclusive with --roles.
   --no-pd                  Force disable PD split even if roles/counts are given;
-                           all nodes run without VLLM_DIST_ROLE and RDMA KV config.
+                           no PD-related vLLM CLI flags are added.
 
-  # Parallelism
+  --pd-master-addr IP      PD only: override --master-addr (default: first MGMT node).
+  --kv-connector NAME      PD only: vLLM JSON kv_connector (KVConnectorFactory v1). Case-insensitive.
+                           $(kv_connector_registry_usage_list)
+                           Default header KV_CONNECTOR=${KV_CONNECTOR}.
+  --nnodes N               PD only: vLLM --nnodes (default: cluster node count). Must be that count or 1;
+                           if 1, every node gets --node-rank 0 (single-rank executor experiment).
+  --data-parallel-size N   Optional: vLLM --data-parallel-size (PD and non-PD); default: omit from ExecStart.
+  --print-config           Print resolved start configuration and exit (no deploy, no health check).
+  --print-raw, --raw       Print the full generated vllm.service body for every node, then exit
+                           (no deploy, no health check). With --print-config, prints summary first.
+
+  # Parallelism (ignored when PD is enabled; use only for non-PD clusters)
   --tp N                   Tensor parallel size (default: ${DEFAULT_TP_SIZE}).
   --pp M                   Pipeline parallel size (default: ${DEFAULT_PP_SIZE}).
 
@@ -112,18 +139,31 @@ Start options:
                            Maps to vLLM --max-num-batched-tokens (default: ${DEFAULT_MAX_BATCH_SIZE}).
   --kv-cache-gb N          CPU KV cache size in GB for VLLM_CPU_KVCACHE_SPACE (default: ${KV_CACHE_GB}).
   --performance-mode MODE  vLLM --performance-mode: balanced | interactivity | throughput
-                           (default: ${DEFAULT_PERFORMANCE_MODE}).
+                           When omitted: non-PD default balanced; PD uses throughput (prefill) /
+                           interactivity (decode). If set, applies to every node.
 
 Examples:
   # Default: PD OFF, all nodes homogeneous
   $0 start --model llama-7b --alias llama
 
-  # Enable PD with explicit roles
+  # Print resolved configuration only (no SSH / systemd changes)
+  $0 start --model llama-7b --alias llama --print-config
+
+  # Print full generated unit file for each node (raw; no SSH)
+  $0 start --model llama-7b --alias llama --print-raw
+
+  # Summary then raw unit bodies
+  $0 start --model llama-7b --alias llama --print-config --print-raw
+
+  # Enable PD with explicit roles (no --tp/--pp with PD)
   $0 start --model llama-7b --alias llama-pd \\
-      --roles prefill,prefill,decode,decode --tp 2 --pp 2 --max-num-batched-tokens 32
+      --roles prefill,prefill,decode,decode --max-num-batched-tokens 32
 
   # Enable PD with counts (2 prefill, 2 decode)
-  $0 start --model llama-7b --num-prefill 2 --num-decode 2 --tp 4 --max-num-batched-tokens 64
+  $0 start --model llama-7b --num-prefill 2 --num-decode 2 --max-num-batched-tokens 64
+
+  # PD experiment: vLLM --nnodes 1 and --node-rank 0 on every node; optional DP
+  $0 start --model llama-7b --num-prefill 2 --num-decode 2 --nnodes 1 --data-parallel-size 4 --print-config
 
 EOF
 }
@@ -141,6 +181,24 @@ error_exit() {
 require_command() {
     local cmd="$1"
     command -v "$cmd" >/dev/null 2>&1 || error_exit "Required command '$cmd' not found in PATH."
+}
+
+# Map user or header kv_connector to canonical factory name (case-insensitive). Echo canonical or return 1.
+canonical_kv_connector() {
+    local input="$1"
+    local il="${input,,}"
+    local c
+    for c in "${KV_CONNECTOR_REGISTRY[@]}"; do
+        if [[ "${il}" == "${c,,}" ]]; then
+            echo "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+kv_connector_registry_usage_list() {
+    (IFS=,; echo "${KV_CONNECTOR_REGISTRY[*]}")
 }
 
 resolve_model_path() {
@@ -173,7 +231,7 @@ resolve_model_path() {
 
 generate_service_file() {
     local role="$1"         # "prefill" | "decode" | "none"
-    local rdma_ip="$2"      # 100.0.0.x, may be empty if PD disabled
+    local rdma_ip="$2"      # reserved / unused in unit (positional for callers)
     local model_path="$3"
     local model_alias="$4"
     local tp_size="$5"
@@ -184,28 +242,48 @@ generate_service_file() {
     local block_size="${10}"
     local kv_cache_gb="${11}"
     local performance_mode="${12}"
+    local node_rank="${13}"
+    local pd_nnodes_cli="${14}"
+    local master_addr="${15}"
+    local kv_connector="${16}"
+    local data_parallel_size="${17:-}"
 
-    # Build optional PD-specific environment and ExecStart flags
-    local pd_env=""
-    if [[ "$PD_ENABLED" == "true" && "$role" != "none" ]]; then
-        pd_env+="Environment=VLLM_DIST_ROLE=${role}"$'\n'
-        pd_env+="Environment=VLLM_KV_TRANSFER_PROTOCOL=nixl"$'\n'
-        pd_env+="Environment=VLLM_NIXL_INTERFACE=${NIXL_INTERFACE}"$'\n'
-        pd_env+="Environment=VLLM_KV_CONNECTOR_CFG={\"port\": ${KV_PORT}}"$'\n'
+    local dp_line=""
+    if [[ -n "$data_parallel_size" ]]; then
+        dp_line="  --data-parallel-size ${data_parallel_size} \\
+"
     fi
 
-    # Optional TP/PP flags
+    local pd_cli=""
+    local kv_role_vllm=""
+    if [[ "$PD_ENABLED" == "true" && "$role" != "none" ]]; then
+        # vLLM KVTransferConfig expects kv_role: kv_producer | kv_both | kv_consumer (not prefill/decode).
+        case "$role" in
+            prefill) kv_role_vllm="kv_producer" ;;
+            decode) kv_role_vllm="kv_consumer" ;;
+            *) error_exit "Internal error: invalid PD role '${role}' (expected prefill or decode)" ;;
+        esac
+        pd_cli="  --kv-transfer-config '{\"kv_role\":\"${kv_role_vllm}\",\"kv_connector\":\"${kv_connector}\"}' \\
+  --attention-config '{\"use_prefill_decode_attention\": true}' \\
+  --master-addr ${master_addr} \\
+  --nnodes ${pd_nnodes_cli} \\
+  --node-rank ${node_rank} \\
+${dp_line}  --distributed-executor-backend mp"
+    fi
+
     local tp_flag=""
     local pp_flag=""
-    if [[ "$tp_size" -gt 1 ]]; then
-        tp_flag="--tensor-parallel-size ${tp_size}"
-    fi
-    if [[ "$pp_size" -gt 1 ]]; then
-        pp_flag="--pipeline-parallel-size ${pp_size}"
+    if [[ "$PD_ENABLED" != "true" ]]; then
+        if [[ "$tp_size" -gt 1 ]]; then
+            tp_flag="--tensor-parallel-size ${tp_size}"
+        fi
+        if [[ "$pp_size" -gt 1 ]]; then
+            pp_flag="--pipeline-parallel-size ${pp_size}"
+        fi
     fi
 
-    # Write the temporary service file
-    cat <<EOF > vllm.service.tmp
+    if [[ -n "$pd_cli" ]]; then
+        cat <<EOF > vllm.service.tmp
 [Unit]
 Description=vLLM CPU Cluster Node (role=${role})
 After=network-online.target
@@ -220,7 +298,47 @@ Environment=VLLM_CPU_OMP_THREADS_BIND=auto
 Environment="OMP_NUM_THREADS=${OMP_NUM_THREADS}"
 Environment="MKL_NUM_THREADS=${MKL_NUM_THREADS}"
 Environment=LD_PRELOAD=${TCMALLOC_PATH}:${IOMP5_PATH}
-${pd_env}Environment=VLLM_LOGGING_LEVEL=info
+Environment=VLLM_LOGGING_LEVEL=info
+
+ExecStart=${PYTHON_BIN} -m vllm.entrypoints.openai.api_server \\
+  --model ${model_path} \\
+  --host 0.0.0.0 \\
+  --port 8000 \\
+  --served-model-name ${model_alias} \\
+${pd_cli} \\
+  --max-model-len ${max_len} \\
+  --max-num-seqs ${max_seqs} \\
+  --block-size ${block_size} \\
+  --max-num-batched-tokens ${max_batch} \\
+  --performance-mode ${performance_mode} \\
+  --enable-prefix-caching \\
+  --enable-chunked-prefill \\
+  ${tp_flag} \\
+  ${pp_flag}
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    else
+        cat <<EOF > vllm.service.tmp
+[Unit]
+Description=vLLM CPU Cluster Node (role=${role})
+After=network-online.target
+
+[Service]
+User=labroot
+WorkingDirectory=/home/labroot
+
+Environment=VLLM_TARGET_DEVICE=cpu
+Environment=VLLM_CPU_KVCACHE_SPACE=${kv_cache_gb}
+Environment=VLLM_CPU_OMP_THREADS_BIND=auto
+Environment="OMP_NUM_THREADS=${OMP_NUM_THREADS}"
+Environment="MKL_NUM_THREADS=${MKL_NUM_THREADS}"
+Environment=LD_PRELOAD=${TCMALLOC_PATH}:${IOMP5_PATH}
+Environment=VLLM_LOGGING_LEVEL=info
 
 ExecStart=${PYTHON_BIN} -m vllm.entrypoints.openai.api_server \\
   --model ${model_path} \\
@@ -233,7 +351,8 @@ ExecStart=${PYTHON_BIN} -m vllm.entrypoints.openai.api_server \\
   --max-num-batched-tokens ${max_batch} \\
   --performance-mode ${performance_mode} \\
   --enable-prefix-caching \\
-  ${tp_flag} \\
+  --enable-chunked-prefill \\
+${dp_line}  ${tp_flag} \\
   ${pp_flag}
 
 Restart=always
@@ -242,6 +361,7 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
+    fi
 }
 
 
@@ -262,9 +382,16 @@ do_start() {
     local max_seqs="${MAX_SEQS}"
     local block_size="${BLOCK_SIZE}"
     local kv_cache_gb="${KV_CACHE_GB}"
-    local performance_mode="${DEFAULT_PERFORMANCE_MODE}"
+    local performance_mode=""
+    local performance_mode_explicit="false"
     local pd_flag="${PD_ENABLED}"
     local no_pd_set="false"
+    local pd_master_addr=""
+    local kv_connector_arg=""
+    local print_config_only="false"
+    local print_raw_only="false"
+    local pd_nnodes_override=""
+    local data_parallel_size=""
 
     # Parse options for "start"
     while [[ $# -gt 0 ]]; do
@@ -292,6 +419,28 @@ do_start() {
             --no-pd)
                 pd_flag="false"
                 no_pd_set="true"
+                ;;
+            --pd-master-addr)
+                shift
+                pd_master_addr="${1:-}"
+                ;;
+            --kv-connector)
+                shift
+                kv_connector_arg="${1:-}"
+                ;;
+            --nnodes)
+                shift
+                pd_nnodes_override="${1:-}"
+                ;;
+            --data-parallel-size)
+                shift
+                data_parallel_size="${1:-}"
+                ;;
+            --print-config)
+                print_config_only="true"
+                ;;
+            --print-raw|--raw)
+                print_raw_only="true"
                 ;;
             --tp)
                 shift
@@ -324,6 +473,7 @@ do_start() {
             --performance-mode)
                 shift
                 performance_mode="${1:-}"
+                performance_mode_explicit="true"
                 ;;
             *)
                 error_exit "Unknown option for start: $1"
@@ -351,13 +501,20 @@ do_start() {
     [[ "$max_batch" -ge 1 ]] || error_exit "--max-num-batched-tokens must be >= 1."
     [[ "$kv_cache_gb" -ge 1 ]] || error_exit "--kv-cache-gb must be >= 1."
 
-    performance_mode=$(echo "$performance_mode" | tr '[:upper:]' '[:lower:]')
-    case "$performance_mode" in
-        balanced|interactivity|throughput) ;;
-        *)
-            error_exit "--performance-mode must be one of: balanced, interactivity, throughput (got '${performance_mode}')"
-            ;;
-    esac
+    if [[ -n "$data_parallel_size" ]]; then
+        [[ "$data_parallel_size" =~ ^[0-9]+$ ]] || error_exit "--data-parallel-size must be a positive integer."
+        [[ "$data_parallel_size" -ge 1 ]] || error_exit "--data-parallel-size must be >= 1."
+    fi
+
+    if [[ "$performance_mode_explicit" == "true" ]]; then
+        performance_mode=$(echo "$performance_mode" | tr '[:upper:]' '[:lower:]')
+        case "$performance_mode" in
+            balanced|interactivity|throughput) ;;
+            *)
+                error_exit "--performance-mode must be one of: balanced, interactivity, throughput (got '${performance_mode}')"
+                ;;
+        esac
+    fi
 
     # Decide PD enablement:
     # - If --no-pd was given, PD stays disabled even if roles/counts are provided.
@@ -372,6 +529,20 @@ do_start() {
     # Propagate to global flag used in service generation
     PD_ENABLED="$pd_flag"
 
+    local num_nodes="${#MGMT_NODES[@]}"
+    local pd_effective_nnodes="${pd_nnodes_override:-$num_nodes}"
+    if [[ "$pd_flag" == "true" ]]; then
+        if [[ -n "$pd_nnodes_override" ]]; then
+            [[ "$pd_effective_nnodes" =~ ^[0-9]+$ ]] || error_exit "--nnodes must be a positive integer."
+            [[ "$pd_effective_nnodes" -ge 1 ]] || error_exit "--nnodes must be >= 1."
+            if [[ "$pd_effective_nnodes" -ne "$num_nodes" && "$pd_effective_nnodes" -ne 1 ]]; then
+                error_exit "PD --nnodes must be ${num_nodes} (cluster size, default) or 1 (all nodes use --node-rank 0); got ${pd_effective_nnodes}."
+            fi
+        fi
+    else
+        [[ -z "$pd_nnodes_override" ]] || error_exit "--nnodes is only valid when PD is enabled (use --roles or --num-prefill / --num-decode)."
+    fi
+
     # Resolve model path and alias
     local model_path
     model_path="$(resolve_model_path "$model_input")"
@@ -379,22 +550,19 @@ do_start() {
         alias="$(basename "$model_path")"
     fi
 
-    echo "Starting cluster with:"
-    echo "  Python (uv, not conda): ${PYTHON_BIN}"
-    echo "  Model path : ${model_path}"
-    echo "  Alias      : ${alias}"
-    echo "  TP / PP    : ${tp_size} / ${pp_size}"
-    echo "  PD enabled : ${pd_flag}"
-    echo "  Max batched tokens : ${max_batch}"
-    echo "  Max model len      : ${max_len}"
-    echo "  Max num seqs       : ${max_seqs}"
-    echo "  Block size         : ${block_size}"
-    echo "  KV cache GB        : ${kv_cache_gb}"
-    echo "  Performance mode   : ${performance_mode}"
+    local resolved_kv_connector="${KV_CONNECTOR}"
+    [[ -n "$kv_connector_arg" ]] && resolved_kv_connector="$kv_connector_arg"
+    if [[ "$pd_flag" == "true" ]]; then
+        local _kv_canon
+        _kv_canon="$(canonical_kv_connector "$resolved_kv_connector")" || error_exit \
+            "--kv-connector / header KV_CONNECTOR must be a vLLM v1 registry name (case-insensitive). Got '${resolved_kv_connector}'. Valid: $(kv_connector_registry_usage_list)"
+        resolved_kv_connector="$_kv_canon"
+    fi
+
+    local master_addr="${pd_master_addr:-${MGMT_NODES[0]}}"
 
     # Determine roles per node
     local roles=()
-    local num_nodes="${#MGMT_NODES[@]}"
 
     if [[ "$pd_flag" == "false" ]]; then
         for ((i = 0; i < num_nodes; i++)); do
@@ -412,7 +580,6 @@ do_start() {
                 fi
             done
         else
-            # Use num-prefill / num-decode if provided
             if [[ -n "$num_prefill" || -n "$num_decode" ]]; then
                 [[ "$num_prefill" =~ ^[0-9]+$ ]] || error_exit "--num-prefill must be a non-negative integer."
                 [[ "$num_decode" =~ ^[0-9]+$ ]] || error_exit "--num-decode must be a non-negative integer."
@@ -427,7 +594,6 @@ do_start() {
                     fi
                 done
             else
-                # Default PD layout: first half prefill, second half decode
                 local half=$((num_nodes / 2))
                 for ((i = 0; i < num_nodes; i++)); do
                     if [[ "$i" -lt "$half" ]]; then
@@ -440,10 +606,97 @@ do_start() {
         fi
     fi
 
-    echo "Node roles:"
-    for i in "${!MGMT_NODES[@]}"; do
-        echo "  ${MGMT_NODES[$i]} (RDMA ${RDMA_IPS[$i]}): role=${roles[$i]}"
+    # Per-node effective --performance-mode
+    local eff_perf=()
+    for ((i = 0; i < num_nodes; i++)); do
+        if [[ "$performance_mode_explicit" == "true" ]]; then
+            eff_perf+=("$performance_mode")
+        elif [[ "$pd_flag" != "true" ]]; then
+            eff_perf+=("balanced")
+        elif [[ "${roles[$i]}" == "prefill" ]]; then
+            eff_perf+=("throughput")
+        else
+            eff_perf+=("interactivity")
+        fi
     done
+
+    echo ""
+    if [[ "$print_raw_only" != "true" || "$print_config_only" == "true" ]]; then
+    echo "========== Launch configuration (about to apply) =========="
+    if [[ "$print_config_only" == "true" ]]; then
+        echo "Mode: --print-config (no remote changes applied)"
+    fi
+    if [[ "$print_raw_only" == "true" && "$print_config_only" == "true" ]]; then
+        echo "Mode: --print-raw follows (full vllm.service per node below)"
+    fi
+    echo "Python (uv):              ${PYTHON_BIN}"
+    echo "Model path (--model):     ${model_path}"
+    echo "Served name (--alias):    ${alias}"
+    echo "PD enabled:               ${pd_flag}"
+    echo "--enable-chunked-prefill: on by default (written to each node ExecStart)"
+    if [[ "$pd_flag" == "true" ]]; then
+        echo "--master-addr:            ${master_addr}"
+        echo "--nnodes:                 ${pd_effective_nnodes}"
+        if [[ "$pd_effective_nnodes" -eq 1 ]]; then
+            echo "PD --node-rank:           0 on every node (--nnodes 1 mode)"
+        else
+            echo "PD --node-rank:           0 .. $((num_nodes - 1)) (per node index)"
+        fi
+        echo "kv_connector (JSON):     ${resolved_kv_connector}"
+        echo "master port (vLLM default): ${VLLM_DEFAULT_MASTER_PORT_DOC} (--master-port not passed)"
+    fi
+    echo "Max batched tokens:       ${max_batch}"
+    echo "Max model len:            ${max_len}"
+    echo "Max num seqs:             ${max_seqs}"
+    echo "Block size:               ${block_size}"
+    echo "KV cache GB (env):        ${kv_cache_gb}"
+    if [[ -n "$data_parallel_size" ]]; then
+        echo "--data-parallel-size:     ${data_parallel_size}"
+    fi
+    echo "TP / PP (non-PD only):    ${tp_size} / ${pp_size}"
+    if [[ "$performance_mode_explicit" == "true" ]]; then
+        echo "--performance-mode:       ${performance_mode} (explicit, all nodes)"
+    else
+        echo "--performance-mode:       (per-node defaults: non-PD balanced; PD prefill throughput / decode interactivity)"
+    fi
+    echo ""
+    echo "Per node:"
+    for i in "${!MGMT_NODES[@]}"; do
+        local sum_rank="$i"
+        if [[ "$pd_flag" == "true" && "$pd_effective_nnodes" -eq 1 ]]; then
+            sum_rank=0
+        fi
+        echo "  ${MGMT_NODES[$i]}  RDMA ${RDMA_IPS[$i]}  role=${roles[$i]}  node-rank=${sum_rank}  --performance-mode=${eff_perf[$i]}"
+    done
+    echo "=========================================="
+    echo ""
+    fi
+
+    if [[ "$print_config_only" == "true" && "$print_raw_only" != "true" ]]; then
+        return 0
+    fi
+
+    if [[ "$print_raw_only" == "true" ]]; then
+        echo "########## Raw systemd units (generated vllm.service per node) ##########"
+        for i in "${!MGMT_NODES[@]}"; do
+            local mgmt_ip="${MGMT_NODES[$i]}"
+            local rdma_ip="${RDMA_IPS[$i]}"
+            local role="${roles[$i]}"
+            local eff_rank="$i"
+            if [[ "$pd_flag" == "true" && "$pd_effective_nnodes" -eq 1 ]]; then
+                eff_rank=0
+            fi
+            generate_service_file "$role" "$rdma_ip" "$model_path" "$alias" \
+                "$tp_size" "$pp_size" "$max_batch" "$max_len" "$max_seqs" "$block_size" "$kv_cache_gb" \
+                "${eff_perf[$i]}" "$eff_rank" "$pd_effective_nnodes" "$master_addr" "$resolved_kv_connector" "$data_parallel_size"
+            echo ""
+            echo "########## ${mgmt_ip}  RDMA ${rdma_ip}  role=${role}  node-rank=${eff_rank} ##########"
+            cat vllm.service.tmp
+            echo ""
+        done
+        rm -f vllm.service.tmp
+        return 0
+    fi
 
     # Deploy service to each node
     for i in "${!MGMT_NODES[@]}"; do
@@ -453,8 +706,13 @@ do_start() {
 
         echo "Configuring node ${mgmt_ip} (RDMA ${rdma_ip}, role=${role})..."
 
+        local eff_rank="$i"
+        if [[ "$pd_flag" == "true" && "$pd_effective_nnodes" -eq 1 ]]; then
+            eff_rank=0
+        fi
         generate_service_file "$role" "$rdma_ip" "$model_path" "$alias" \
-            "$tp_size" "$pp_size" "$max_batch" "$max_len" "$max_seqs" "$block_size" "$kv_cache_gb" "$performance_mode"
+            "$tp_size" "$pp_size" "$max_batch" "$max_len" "$max_seqs" "$block_size" "$kv_cache_gb" \
+            "${eff_perf[$i]}" "$eff_rank" "$pd_effective_nnodes" "$master_addr" "$resolved_kv_connector" "$data_parallel_size"
 
         scp vllm.service.tmp "labroot@${mgmt_ip}:/tmp/vllm.service" >/dev/null 2>&1 || \
             error_exit "Failed to copy service file to ${mgmt_ip}."
@@ -477,22 +735,32 @@ do_start() {
             echo "Model path (--model):               ${model_path}"
             echo "Served name (--served-model-name):  ${alias}"
             echo "Listen:                             host=0.0.0.0 port=8000"
-            echo "Tensor parallel size:              ${tp_size}"
-            echo "Pipeline parallel size:            ${pp_size}"
-            if [[ "$tp_size" -gt 1 ]]; then
-                echo "ExecStart --tensor-parallel-size: ${tp_size}"
-            else
-                echo "ExecStart --tensor-parallel-size:  (omitted, tp=1)"
-            fi
-            if [[ "$pp_size" -gt 1 ]]; then
-                echo "ExecStart --pipeline-parallel-size: ${pp_size}"
-            else
-                echo "ExecStart --pipeline-parallel-size:  (omitted, pp=1)"
-            fi
             echo "Prefill/decode (PD) enabled:       ${pd_flag}"
             if [[ "$pd_flag" == "true" ]]; then
-                echo "NIXL interface:                    ${NIXL_INTERFACE}"
-                echo "KV connector port:                 ${KV_PORT}"
+                echo "PD CLI --master-addr:              ${master_addr}"
+                echo "PD CLI --nnodes:                   ${pd_effective_nnodes}"
+                echo "PD kv_connector:                   ${resolved_kv_connector}"
+                if [[ -n "$data_parallel_size" ]]; then
+                    echo "PD CLI --data-parallel-size:       ${data_parallel_size}"
+                fi
+                echo "ExecStart: no --tensor-parallel-size / --pipeline-parallel-size when PD on"
+                echo "master port (reference, vLLM default): ${VLLM_DEFAULT_MASTER_PORT_DOC}"
+            else
+                if [[ -n "$data_parallel_size" ]]; then
+                    echo "ExecStart --data-parallel-size:    ${data_parallel_size}"
+                fi
+                echo "Tensor parallel size:              ${tp_size}"
+                echo "Pipeline parallel size:            ${pp_size}"
+                if [[ "$tp_size" -gt 1 ]]; then
+                    echo "ExecStart --tensor-parallel-size: ${tp_size}"
+                else
+                    echo "ExecStart --tensor-parallel-size:  (omitted, tp=1)"
+                fi
+                if [[ "$pp_size" -gt 1 ]]; then
+                    echo "ExecStart --pipeline-parallel-size: ${pp_size}"
+                else
+                    echo "ExecStart --pipeline-parallel-size:  (omitted, pp=1)"
+                fi
             fi
             echo "VLLM_TARGET_DEVICE:                cpu"
             echo "VLLM_CPU_OMP_THREADS_BIND:        auto"
@@ -501,7 +769,12 @@ do_start() {
             echo "Max num seqs:                       ${max_seqs}"
             echo "Block size:                         ${block_size}"
             echo "Max num batched tokens:            ${max_batch}"
-            echo "Performance mode (--performance-mode): ${performance_mode}"
+            if [[ "$performance_mode_explicit" == "true" ]]; then
+                echo "Performance mode (--performance-mode): ${performance_mode} (all nodes)"
+            else
+                echo "Performance mode:                   per-node (see list below)"
+            fi
+            echo "--enable-chunked-prefill:           enabled (all nodes)"
             echo "VLLM_CPU_KVCACHE_SPACE (GB):       ${kv_cache_gb}"
             echo "OMP_NUM_THREADS:                   ${OMP_NUM_THREADS}"
             echo "MKL_NUM_THREADS:                   ${MKL_NUM_THREADS}"
@@ -510,9 +783,9 @@ do_start() {
             echo "Prefix caching:                     enabled (--enable-prefix-caching)"
             echo "Gateway (health check):            ${GATEWAY_URL}"
             echo ""
-            echo "Per-node role (VLLM_DIST_ROLE when PD on):"
+            echo "Per-node role and --performance-mode:"
             for i in "${!MGMT_NODES[@]}"; do
-                echo "  ${MGMT_NODES[$i]}  RDMA ${RDMA_IPS[$i]}  role=${roles[$i]}"
+                echo "  ${MGMT_NODES[$i]}  RDMA ${RDMA_IPS[$i]}  role=${roles[$i]}  rank=${i}  perf=${eff_perf[$i]}"
             done
             echo "========================================================="
             return 0

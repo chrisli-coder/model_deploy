@@ -1,6 +1,6 @@
 ### Cluster model launcher usage
 
-This repository provides `cluster_model.sh` to control a multi-node vLLM CPU cluster across four nodes (`192.168.1.141-144`) with RDMA (`100.0.0.1-4`).
+This repository provides `cluster_model.sh` to control a multi-node vLLM CPU cluster across four nodes (`192.168.1.141-144`) with RDMA IPs (`100.0.0.141-144`) on the management/RDMA mapping used by the script.
 
 #### Basic commands
 
@@ -10,9 +10,15 @@ This repository provides `cluster_model.sh` to control a multi-node vLLM CPU clu
 ./cluster_model.sh start --model llama-7b --alias llama
 ```
 
-This assumes the model is located at `/home/labroot/models/llama-7b` on all nodes. The alias `llama` is exposed at the OpenAI-compatible gateway (`http://192.168.1.145/v1/models`).
+This assumes the model directory exists on the **machine running the script** under `/home/labroot/models/llama-7b` (or pass an absolute path). The alias `llama` is what the OpenAI-compatible gateway (`http://192.168.1.145/v1/models`) should list once workers are healthy.
 
-By default, **PD (prefill/decode split) is OFF**, so all nodes run the same role without `VLLM_DIST_ROLE` or RDMA KV transfer configuration.
+By default, **PD (prefill/decode split) is OFF**: all nodes get the same `ExecStart` (no PD-specific vLLM flags).
+
+Every start **prints a full “即将应用” configuration block** before any SSH/systemd changes. To **only print** that block and exit (no deploy, no gateway check):
+
+```bash
+./cluster_model.sh start --model llama-7b --alias llama --print-config
+```
 
 - **Stop, restart, status**
 
@@ -24,7 +30,18 @@ By default, **PD (prefill/decode split) is OFF**, so all nodes run the same role
 
 #### Prefill / decode (PD) split
 
-PD is **disabled by default** and is automatically enabled when you pass `--roles` or `--num-prefill/--num-decode`. Use `--no-pd` to force PD off even if those options are present.
+PD is **disabled by default** and turns on when you pass `--roles` or `--num-prefill` / `--num-decode` (unless you pass `--no-pd`).
+
+When PD is on, workers are configured with vLLM CLI (not legacy env vars): `--kv-transfer-config`, `--attention-config` (`use_prefill_decode_attention`), `--master-addr`, `--nnodes`, `--node-rank`, and `--distributed-executor-backend mp`. **`--master-port` is not passed** (vLLM default); the pre-deploy summary mentions the documented default port for operators.
+
+- **`kv_connector`** in `--kv-transfer-config` must be a **vLLM v1 `KVConnectorFactory` registry name** (exact JSON string), for example **`NixlConnector`**, **`P2pNcclConnector`**, **`LMCacheConnectorV1`**, etc. The script header `KV_CONNECTOR` defaults to **`NixlConnector`**; override with **`--kv-connector NAME`** (matching is case-insensitive). Legacy aliases **`gloo`** / **`nixl`** are removed—they were never valid factory names in recent vLLM.
+- **Default `--master-addr`** is the first management IP in `MGMT_NODES`. Override with `--pd-master-addr IP`.
+- **Optional PD tuning**: `--nnodes N` overrides vLLM `--nnodes` (default: cluster node count). Allowed values are the cluster size or **`1`**; with **`1`**, every node gets **`--node-rank 0`** so you can compare behavior against multi-rank mode. **`--data-parallel-size N`** adds vLLM `--data-parallel-size` on every node when set (PD or non-PD).
+- **Tensor / pipeline parallel (`--tp` / `--pp`) are not applied when PD is enabled** (PD layout uses `mp` only in this script).
+
+**`--performance-mode`**: if you omit it, non-PD clusters use `balanced` on every node; PD uses `throughput` on prefill nodes and `interactivity` on decode nodes. If you set `--performance-mode X` explicitly, **every node** uses `X`.
+
+**`--enable-chunked-prefill`** is **enabled by default** on all nodes (PD and non-PD).
 
 - **Explicit roles per node**
 
@@ -35,14 +52,14 @@ PD is **disabled by default** and is automatically enabled when you pass `--role
   --roles prefill,prefill,decode,decode
 ```
 
-The roles are mapped positionally to nodes:
+Mapping:
 
 - `192.168.1.141` → `prefill`
 - `192.168.1.142` → `prefill`
 - `192.168.1.143` → `decode`
 - `192.168.1.144` → `decode`
 
-- **Specify counts instead of full mapping**
+- **Counts instead of a full role list**
 
 ```bash
 ./cluster_model.sh start \
@@ -51,9 +68,7 @@ The roles are mapped positionally to nodes:
   --num-decode 2
 ```
 
-This yields the same layout as above (first two nodes prefill, last two decode).
-
-- **Disable PD split**
+- **Force PD off** (homogeneous nodes, no PD CLI)
 
 ```bash
 ./cluster_model.sh start \
@@ -62,11 +77,9 @@ This yields the same layout as above (first two nodes prefill, last two decode).
   --no-pd
 ```
 
-In this example, `--no-pd` **forces PD off** even though roles are specified, so all nodes run without `VLLM_DIST_ROLE` or RDMA KV transfer configuration.
+#### Parallelism and batch configuration (non-PD)
 
-#### Parallelism and batch configuration
-
-- **Configure tensor/pipeline parallelism and batch size**
+Use `--tp` and `--pp` only when **PD is off**. Example:
 
 ```bash
 ./cluster_model.sh start \
@@ -81,5 +94,4 @@ In this example, `--no-pd` **forces PD off** even though roles are specified, so
   --performance-mode throughput
 ```
 
-Adjust `--tp` and `--pp` based on your vLLM deployment topology and hardware, and tune `--max-num-batched-tokens`, `--max-model-len`, `--max-num-seqs`, `--block-size`, and `--performance-mode` (`balanced`, `interactivity`, or `throughput`; defaults apply when omitted) as needed for throughput and latency.
-
+Tune `--max-num-batched-tokens`, `--max-model-len`, `--max-num-seqs`, `--block-size`, and `--performance-mode` (`balanced`, `interactivity`, or `throughput`) as needed.
