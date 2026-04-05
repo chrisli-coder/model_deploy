@@ -30,6 +30,8 @@ MODELS_ROOT="/home/labroot/models"
 
 # CPU tuning defaults
 KV_CACHE_GB=40
+# vLLM env VLLM_LOGGING_LEVEL (Python logging level names; case-insensitive when passed via CLI)
+DEFAULT_VLLM_LOGGING_LEVEL=info
 MAX_LEN=4096
 BLOCK_SIZE=32
 MAX_SEQS=16
@@ -120,6 +122,8 @@ Start options:
   --kv-connector NAME      PD only: vLLM JSON kv_connector (KVConnectorFactory v1). Case-insensitive.
                            $(kv_connector_registry_usage_list)
                            Default header KV_CONNECTOR=${KV_CONNECTOR}.
+                           For NixlConnector only: adds kv_connector_extra_config with backends [UCX],
+                           side_channel_host = this node's RDMA_IPS entry, peer_ips = opposite role RDMA IPs.
   --nnodes N               PD only: vLLM --nnodes (default: cluster node count). Must be that count or 1;
                            if 1, every node gets --node-rank 0 (single-rank executor experiment).
   --data-parallel-size N   Optional: vLLM --data-parallel-size (PD and non-PD); default: omit from ExecStart.
@@ -138,6 +142,8 @@ Start options:
   --max-num-batched-tokens N
                            Maps to vLLM --max-num-batched-tokens (default: ${DEFAULT_MAX_BATCH_SIZE}).
   --kv-cache-gb N          CPU KV cache size in GB for VLLM_CPU_KVCACHE_SPACE (default: ${KV_CACHE_GB}).
+  --vllm-logging-level L   vLLM env VLLM_LOGGING_LEVEL: debug | info | warning | error | critical
+                           (default: ${DEFAULT_VLLM_LOGGING_LEVEL}).
   --performance-mode MODE  vLLM --performance-mode: balanced | interactivity | throughput
                            When omitted: non-PD default balanced; PD uses throughput (prefill) /
                            interactivity (decode). If set, applies to every node.
@@ -201,6 +207,30 @@ kv_connector_registry_usage_list() {
     (IFS=,; echo "${KV_CONNECTOR_REGISTRY[*]}")
 }
 
+# JSON array string for NixlConnector kv_connector_extra_config.peer_ips: opposite PD role only.
+# Args: node_index role roles_array_name rdma_array_name num_nodes (nameref targets must exist in caller).
+build_kv_peer_ips_json() {
+    local my_i="$1"
+    local my_role="$2"
+    local roles_nm="$3"
+    local rdma_nm="$4"
+    local n="$5"
+    local -n _roles="$roles_nm"
+    local -n _rdma="$rdma_nm"
+    local j
+    local parts=()
+    for ((j = 0; j < n; j++)); do
+        [[ "$j" -eq "$my_i" ]] && continue
+        if [[ "$my_role" == "prefill" && "${_roles[j]}" == "decode" ]]; then
+            parts+=("\"${_rdma[j]}\"")
+        elif [[ "$my_role" == "decode" && "${_roles[j]}" == "prefill" ]]; then
+            parts+=("\"${_rdma[j]}\"")
+        fi
+    done
+    local IFS=,
+    echo "[${parts[*]}]"
+}
+
 resolve_model_path() {
     local input="$1"
 
@@ -247,6 +277,8 @@ generate_service_file() {
     local master_addr="${15}"
     local kv_connector="${16}"
     local data_parallel_size="${17:-}"
+    local vllm_logging_level="${18}"
+    local kv_peer_ips_json="${19:-}"
 
     local dp_line=""
     if [[ -n "$data_parallel_size" ]]; then
@@ -263,7 +295,14 @@ generate_service_file() {
             decode) kv_role_vllm="kv_consumer" ;;
             *) error_exit "Internal error: invalid PD role '${role}' (expected prefill or decode)" ;;
         esac
-        pd_cli="  --kv-transfer-config '{\"kv_role\":\"${kv_role_vllm}\",\"kv_connector\":\"${kv_connector}\"}' \\
+        local kv_tf_json=""
+        if [[ "$kv_connector" == "NixlConnector" ]]; then
+            local _peers="${kv_peer_ips_json:-[]}"
+            kv_tf_json="{\"kv_role\":\"${kv_role_vllm}\",\"kv_connector\":\"${kv_connector}\",\"kv_connector_extra_config\":{\"backends\":[\"UCX\"],\"side_channel_host\":\"${rdma_ip}\",\"peer_ips\":${_peers}}}"
+        else
+            kv_tf_json="{\"kv_role\":\"${kv_role_vllm}\",\"kv_connector\":\"${kv_connector}\"}"
+        fi
+        pd_cli="  --kv-transfer-config '${kv_tf_json}' \\
   --attention-config '{\"use_prefill_decode_attention\": true}' \\
   --master-addr ${master_addr} \\
   --nnodes ${pd_nnodes_cli} \\
@@ -298,7 +337,9 @@ Environment=VLLM_CPU_OMP_THREADS_BIND=auto
 Environment="OMP_NUM_THREADS=${OMP_NUM_THREADS}"
 Environment="MKL_NUM_THREADS=${MKL_NUM_THREADS}"
 Environment=LD_PRELOAD=${TCMALLOC_PATH}:${IOMP5_PATH}
-Environment=VLLM_LOGGING_LEVEL=info
+Environment=VLLM_LOGGING_LEVEL=${vllm_logging_level}
+Environment=VLLM_HOST_IP=${rdma_ip}
+Environment=VLLM_NIXL_SIDE_CHANNEL_HOST=${rdma_ip}
 
 ExecStart=${PYTHON_BIN} -m vllm.entrypoints.openai.api_server \\
   --model ${model_path} \\
@@ -338,7 +379,9 @@ Environment=VLLM_CPU_OMP_THREADS_BIND=auto
 Environment="OMP_NUM_THREADS=${OMP_NUM_THREADS}"
 Environment="MKL_NUM_THREADS=${MKL_NUM_THREADS}"
 Environment=LD_PRELOAD=${TCMALLOC_PATH}:${IOMP5_PATH}
-Environment=VLLM_LOGGING_LEVEL=info
+Environment=VLLM_LOGGING_LEVEL=${vllm_logging_level}
+Environment=VLLM_HOST_IP=${rdma_ip}
+Environment=VLLM_NIXL_SIDE_CHANNEL_HOST=${rdma_ip}
 
 ExecStart=${PYTHON_BIN} -m vllm.entrypoints.openai.api_server \\
   --model ${model_path} \\
@@ -382,6 +425,7 @@ do_start() {
     local max_seqs="${MAX_SEQS}"
     local block_size="${BLOCK_SIZE}"
     local kv_cache_gb="${KV_CACHE_GB}"
+    local vllm_logging_level="${DEFAULT_VLLM_LOGGING_LEVEL}"
     local performance_mode=""
     local performance_mode_explicit="false"
     local pd_flag="${PD_ENABLED}"
@@ -470,6 +514,10 @@ do_start() {
                 shift
                 kv_cache_gb="${1:-}"
                 ;;
+            --vllm-logging-level)
+                shift
+                vllm_logging_level="${1:-}"
+                ;;
             --performance-mode)
                 shift
                 performance_mode="${1:-}"
@@ -500,6 +548,14 @@ do_start() {
     [[ "$block_size" -ge 1 ]] || error_exit "--block-size must be >= 1."
     [[ "$max_batch" -ge 1 ]] || error_exit "--max-num-batched-tokens must be >= 1."
     [[ "$kv_cache_gb" -ge 1 ]] || error_exit "--kv-cache-gb must be >= 1."
+
+    vllm_logging_level=$(echo "$vllm_logging_level" | tr '[:upper:]' '[:lower:]')
+    case "$vllm_logging_level" in
+        debug|info|warning|error|critical) ;;
+        *)
+            error_exit "--vllm-logging-level must be one of: debug, info, warning, error, critical (got '${vllm_logging_level}')"
+            ;;
+    esac
 
     if [[ -n "$data_parallel_size" ]]; then
         [[ "$data_parallel_size" =~ ^[0-9]+$ ]] || error_exit "--data-parallel-size must be a positive integer."
@@ -643,6 +699,9 @@ do_start() {
             echo "PD --node-rank:           0 .. $((num_nodes - 1)) (per node index)"
         fi
         echo "kv_connector (JSON):     ${resolved_kv_connector}"
+        if [[ "$resolved_kv_connector" == "NixlConnector" ]]; then
+            echo "Nixl kv_connector_extra_config: backends [UCX]; side_channel_host = node RDMA IP; peer_ips = opposite-role RDMA IPs"
+        fi
         echo "master port (vLLM default): ${VLLM_DEFAULT_MASTER_PORT_DOC} (--master-port not passed)"
     fi
     echo "Max batched tokens:       ${max_batch}"
@@ -650,6 +709,7 @@ do_start() {
     echo "Max num seqs:             ${max_seqs}"
     echo "Block size:               ${block_size}"
     echo "KV cache GB (env):        ${kv_cache_gb}"
+    echo "VLLM_LOGGING_LEVEL (env): ${vllm_logging_level}"
     if [[ -n "$data_parallel_size" ]]; then
         echo "--data-parallel-size:     ${data_parallel_size}"
     fi
@@ -686,9 +746,14 @@ do_start() {
             if [[ "$pd_flag" == "true" && "$pd_effective_nnodes" -eq 1 ]]; then
                 eff_rank=0
             fi
+            local kv_peer_ips_json=""
+            if [[ "$pd_flag" == "true" && "$resolved_kv_connector" == "NixlConnector" && "$role" != "none" ]]; then
+                kv_peer_ips_json="$(build_kv_peer_ips_json "$i" "$role" roles RDMA_IPS "$num_nodes")"
+            fi
             generate_service_file "$role" "$rdma_ip" "$model_path" "$alias" \
                 "$tp_size" "$pp_size" "$max_batch" "$max_len" "$max_seqs" "$block_size" "$kv_cache_gb" \
-                "${eff_perf[$i]}" "$eff_rank" "$pd_effective_nnodes" "$master_addr" "$resolved_kv_connector" "$data_parallel_size"
+                "${eff_perf[$i]}" "$eff_rank" "$pd_effective_nnodes" "$master_addr" "$resolved_kv_connector" "$data_parallel_size" \
+                "$vllm_logging_level" "$kv_peer_ips_json"
             echo ""
             echo "########## ${mgmt_ip}  RDMA ${rdma_ip}  role=${role}  node-rank=${eff_rank} ##########"
             cat vllm.service.tmp
@@ -710,9 +775,14 @@ do_start() {
         if [[ "$pd_flag" == "true" && "$pd_effective_nnodes" -eq 1 ]]; then
             eff_rank=0
         fi
+        local kv_peer_ips_json=""
+        if [[ "$pd_flag" == "true" && "$resolved_kv_connector" == "NixlConnector" && "$role" != "none" ]]; then
+            kv_peer_ips_json="$(build_kv_peer_ips_json "$i" "$role" roles RDMA_IPS "$num_nodes")"
+        fi
         generate_service_file "$role" "$rdma_ip" "$model_path" "$alias" \
             "$tp_size" "$pp_size" "$max_batch" "$max_len" "$max_seqs" "$block_size" "$kv_cache_gb" \
-            "${eff_perf[$i]}" "$eff_rank" "$pd_effective_nnodes" "$master_addr" "$resolved_kv_connector" "$data_parallel_size"
+            "${eff_perf[$i]}" "$eff_rank" "$pd_effective_nnodes" "$master_addr" "$resolved_kv_connector" "$data_parallel_size" \
+            "$vllm_logging_level" "$kv_peer_ips_json"
 
         scp vllm.service.tmp "labroot@${mgmt_ip}:/tmp/vllm.service" >/dev/null 2>&1 || \
             error_exit "Failed to copy service file to ${mgmt_ip}."
@@ -764,7 +834,9 @@ do_start() {
             fi
             echo "VLLM_TARGET_DEVICE:                cpu"
             echo "VLLM_CPU_OMP_THREADS_BIND:        auto"
-            echo "VLLM_LOGGING_LEVEL:                info"
+            echo "VLLM_LOGGING_LEVEL:                ${vllm_logging_level}"
+            echo "VLLM_HOST_IP (env):                per-node RDMA IP (see list below)"
+            echo "VLLM_NIXL_SIDE_CHANNEL_HOST (env):  per-node RDMA IP (see list below)"
             echo "Max model len:                      ${max_len}"
             echo "Max num seqs:                       ${max_seqs}"
             echo "Block size:                         ${block_size}"
