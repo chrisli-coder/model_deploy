@@ -26,6 +26,7 @@ GATEWAY_URL="http://192.168.1.145/v1/models"
 
 # Python: uv virtualenv on each node (not conda). Sync deps with e.g. `uv sync` in that environment.
 PYTHON_BIN="/home/labroot/vllm-cpu/bin/python"
+VLLM_BIN="/home/labroot/vllm-cpu/bin/vllm"
 MODELS_ROOT="/home/labroot/models"
 
 # CPU tuning defaults
@@ -192,10 +193,11 @@ require_command() {
 # Map user or header kv_connector to canonical factory name (case-insensitive). Echo canonical or return 1.
 canonical_kv_connector() {
     local input="$1"
-    local il="${input,,}"
-    local c
+    local il c cl
+    il="$(echo "$input" | tr '[:upper:]' '[:lower:]')"
     for c in "${KV_CONNECTOR_REGISTRY[@]}"; do
-        if [[ "${il}" == "${c,,}" ]]; then
+        cl="$(echo "$c" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$il" == "$cl" ]]; then
             echo "$c"
             return 0
         fi
@@ -215,16 +217,16 @@ build_kv_peer_ips_json() {
     local roles_nm="$3"
     local rdma_nm="$4"
     local n="$5"
-    local -n _roles="$roles_nm"
-    local -n _rdma="$rdma_nm"
-    local j
+    local j role_j rdma_j
     local parts=()
     for ((j = 0; j < n; j++)); do
         [[ "$j" -eq "$my_i" ]] && continue
-        if [[ "$my_role" == "prefill" && "${_roles[j]}" == "decode" ]]; then
-            parts+=("\"${_rdma[j]}\"")
-        elif [[ "$my_role" == "decode" && "${_roles[j]}" == "prefill" ]]; then
-            parts+=("\"${_rdma[j]}\"")
+        eval "role_j=\${${roles_nm}[$j]}"
+        eval "rdma_j=\${${rdma_nm}[$j]}"
+        if [[ "$my_role" == "prefill" && "$role_j" == "decode" ]]; then
+            parts+=("\"${rdma_j}\"")
+        elif [[ "$my_role" == "decode" && "$role_j" == "prefill" ]]; then
+            parts+=("\"${rdma_j}\"")
         fi
     done
     local IFS=,
@@ -341,8 +343,7 @@ Environment=VLLM_LOGGING_LEVEL=${vllm_logging_level}
 Environment=VLLM_HOST_IP=${rdma_ip}
 Environment=VLLM_NIXL_SIDE_CHANNEL_HOST=${rdma_ip}
 
-ExecStart=${PYTHON_BIN} -m vllm.entrypoints.openai.api_server \\
-  --model ${model_path} \\
+ExecStart=${VLLM_BIN} serve ${model_path} \\
   --host 0.0.0.0 \\
   --port 8000 \\
   --served-model-name ${model_alias} \\
@@ -383,8 +384,7 @@ Environment=VLLM_LOGGING_LEVEL=${vllm_logging_level}
 Environment=VLLM_HOST_IP=${rdma_ip}
 Environment=VLLM_NIXL_SIDE_CHANNEL_HOST=${rdma_ip}
 
-ExecStart=${PYTHON_BIN} -m vllm.entrypoints.openai.api_server \\
-  --model ${model_path} \\
+ExecStart=${VLLM_BIN} serve ${model_path} \\
   --host 0.0.0.0 \\
   --port 8000 \\
   --served-model-name ${model_alias} \\
